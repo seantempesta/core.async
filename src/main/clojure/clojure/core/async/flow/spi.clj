@@ -70,8 +70,11 @@
   channels are needed.")
   
   (start [p {:keys [pid args ins outs resolver]}]
-    "return ignored, called for the
-  effect of starting the process (typically, starting its thread)
+    "called for the effect of starting the process (typically, starting
+  its thread). May return a java.util.concurrent.Future completing when
+  the process exits; the graph closes its ::flow/error and ::flow/report
+  channels only after every such future completes, so errors reported
+  while handling ::flow/stop are delivered. Other returns are ignored.
 
   where:
 

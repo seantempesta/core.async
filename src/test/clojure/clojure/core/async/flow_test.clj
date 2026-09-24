@@ -7,6 +7,7 @@
 ;;   You must not remove this notice, or any other, from this software.
 (ns clojure.core.async.flow-test
   (:require [clojure.test :refer :all]
+            [clojure.core.async :as async]
             [clojure.core.async.flow :as flow])
   (:import [java.util.concurrent TimeUnit Future ExecutionException]))
 
@@ -60,3 +61,22 @@
                                                     {:ping-map-fn #(select-keys % [:visible])}))]
       (is (= {:visible 42} ping-state) "secret was not removed"))))
 
+
+(deftest test-stop-transition-error-delivered
+  (testing "an error thrown while handling ::flow/stop reaches the error channel before it closes"
+    (dotimes [_ 20]
+      (let [step (fn ([] {:ins {:in ""}})
+                   ([_] {})
+                   ([state trans] (if (= trans ::flow/stop) (throw (ex-info "stop boom" {})) state))
+                   ([state _ _] [state nil]))
+            g (flow/create-flow {:procs {:p {:proc (flow/process step)}}})
+            {:keys [error-chan]} (flow/start g)]
+        (flow/resume g)
+        (flow/stop g)
+        (let [[err c] (async/alts!! [error-chan (async/timeout 1000)])]
+          (is (= c error-chan))
+          (is (= "stop boom" (some-> err ::flow/ex ex-message)))
+          (is (= [::flow/stop :transition] [(::flow/transition err) (::flow/op err)])))
+        (let [[v c] (async/alts!! [error-chan (async/timeout 1000)])]
+          (is (and (nil? v) (= c error-chan))
+              "the channel closes once the failed stop has exited the proc"))))))

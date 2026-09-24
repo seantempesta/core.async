@@ -163,10 +163,9 @@
                       (catch Throwable ex
                         (async/>!! control-chan #::flow{:command ::flow/stop :to ::flow/all})
                         (throw ex))))]
-              (doseq [p (vals pdescs)]
-                (start-proc p))
               ;;the only connection to a running flow is via channels
               (reset! chans {:control control-chan :resolver resolver :cast cast
+                             :procs (mapv start-proc (vals pdescs))
                              :report report-chan, :error error-chan
                              :ins in-chans, :outs out-chans})
               {:report-chan report-chan :error-chan error-chan}))
@@ -174,11 +173,16 @@
       (stop [_]
         (.lock lock)
         (try
-          (when-let [{:keys [report error]} @chans]
+          (when-let [{:keys [report error procs]} @chans]
             (send-command ::flow/stop ::flow/all)
-            (async/close! error)
-            (async/close! report)
             (reset! chans nil)
+            ;;procs report stop-time errors, so close only after each exits
+            ((futurize (fn []
+                         (doseq [p procs :when (instance? java.util.concurrent.Future p)]
+                           (try (.get ^java.util.concurrent.Future p) (catch Throwable _)))
+                         (async/close! error)
+                         (async/close! report))
+                       {:exec :io}))
             true)
           (finally (.unlock lock))))
       (pause [_] (send-command ::flow/pause ::flow/all))
@@ -278,11 +282,20 @@
                                                              :ins pins :outs pouts})
                                                     ::flow/state (ping-map-fn state)))))
                        handle-command (partial handle-command pid pong)
+                       ;;a throwing transition is reported, keeps state, and still
+                       ;;takes effect, so a failed stop exits
+                       transition (fn [state t]
+                                    (try (step state t)
+                                         (catch Throwable ex
+                                           (async/>!! (outs ::flow/error)
+                                                      #::flow{:pid pid, :status status, :state state, :count count
+                                                              :op :transition, :transition t, :ex ex})
+                                           state)))
                        [nstatus nstate count read-ins]
                        (try
                          (if (= status :paused)
                            (let [nstatus (handle-command status (async/<!! control))
-                                 nstate (handle-transition step status nstatus state)]
+                                 nstate (handle-transition transition status nstatus state)]
                              [nstatus nstate count read-ins])
                            ;;:running
                            (let [ ;;TODO rotate/randomize after control per normal alts?
@@ -296,7 +309,7 @@
                                  cid (io-id c)]
                              (if (= c control)
                                (let [nstatus (handle-command status msg)
-                                     nstate (handle-transition step status nstatus state)]
+                                     nstate (handle-transition transition status nstatus state)]
                                  [nstatus nstate count read-ins])
                                (try
                                  (let [[nstate outputs]
@@ -305,7 +318,7 @@
                                          (transform state cid msg))
                                        [nstatus nstate]
                                        (send-outputs status nstate outputs outs
-                                                     resolver control handle-command step cast)]
+                                                     resolver control handle-command transition cast)]
                                    [nstatus nstate (inc count) (if (some? msg)
                                                                  read-ins
                                                                  (dissoc read-ins cid))])
